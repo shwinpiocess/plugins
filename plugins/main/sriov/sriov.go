@@ -36,7 +36,6 @@ import (
 
 type NetConf struct {
 	types.NetConf
-	Master string `json:"master"`
 	VlanId int    `json:"vlanId"`
 	MTU    int    `json:"mtu,omitempty"`
 }
@@ -53,9 +52,6 @@ func loadConf(bytes []byte) (*NetConf, string, error) {
 	if err := json.Unmarshal(bytes, n); err != nil {
 		return nil, "", fmt.Errorf("failed to load netconf: %v", err)
 	}
-	if n.Master == "" {
-		return nil, "", fmt.Errorf(`"master" field is required. It specifies the host interface name to create the VLAN for.`)
-	}
 	if n.VlanId < 0 || n.VlanId > 4094 {
 		return nil, "", fmt.Errorf(`invalid VLAN ID %d (must be between 0 and 4095 inclusive)`, n.VlanId)
 	}
@@ -66,15 +62,11 @@ func setupVF(conf *NetConf, ifName string, netns ns.NetNS) (*current.Interface, 
 	vf := &current.Interface{}
 
 	// 申请一个可用的Virtual Function
-	vfIdx, vfDevName, err := allocFreeVF(conf.Master)
+	m, vfIdx, vfDevName, err := allocFreeVF()
 	if err != nil {
 		return nil, err
 	}
-
-	m, err := netlink.LinkByName(conf.Master)
-	if err != nil {
-		return nil, fmt.Errorf("failed to lookup master %q: %v", conf.Master, err)
-	}
+	fmt.Fprintf(os.Stderr, "***********CNI SR-IOV 成功申请%v网卡的第%v个VF, 名称为: %v\n", m.Attrs().Name, vfIdx, vfDevName)
 
 	vfDev, err := netlink.LinkByName(vfDevName)
 	if err != nil {
@@ -126,48 +118,61 @@ func setupVF(conf *NetConf, ifName string, netns ns.NetNS) (*current.Interface, 
 	return vf, nil
 }
 
-func allocFreeVF(master string) (int, string, error) {
+func allocFreeVF() (netlink.Link, int, string, error) {
 	vfIdx := -1
 	devName := ""
 
-	sriovFile := fmt.Sprintf("/sys/class/net/%s/device/sriov_numvfs", master)
-	if _, err := os.Lstat(sriovFile); err != nil {
-		return -1, "", fmt.Errorf("failed to open the sriov_numfs of device %q: %v", master, err)
-	}
-
-	data, err := ioutil.ReadFile(sriovFile)
+	// 获取机器可用物理网卡(PF)列表
+	links, err := netlink.LinkList()
 	if err != nil {
-		return -1, "", fmt.Errorf("failed to read the sriov_numfs of device %q: %v", master, err)
+		return nil, -1, "", fmt.Errorf("获取可用物理网卡失败: %v", err)
 	}
 
-	if len(data) == 0 {
-		return -1, "", fmt.Errorf("no data in the file %q", sriovFile)
-	}
+	for _, link := range links {
+		if link.Type() == "device" && link.Attrs().OperState == netlink.OperUp {
+			master := link.Attrs().Name
 
-	sriovNumfs := strings.TrimSpace(string(data))
-	vfTotal, err := strconv.Atoi(sriovNumfs)
-	if err != nil {
-		return -1, "", fmt.Errorf("failed to convert sriov_numfs(byte value) to int of device %q: %v", master, err)
-	}
+			sriovFile := fmt.Sprintf("/sys/class/net/%s/device/sriov_numvfs", master)
+			if _, err := os.Lstat(sriovFile); err != nil {
+				return nil, -1, "", fmt.Errorf("failed to open the sriov_numfs of device %q: %v", master, err)
+			}
 
-	if vfTotal <= 0 {
-		return -1, "", fmt.Errorf("no virtual function in the device %q: %v", master)
-	}
+			data, err := ioutil.ReadFile(sriovFile)
+			if err != nil {
+				return nil, -1, "", fmt.Errorf("failed to read the sriov_numfs of device %q: %v", master, err)
+			}
 
-	for vf := 0; vf < vfTotal; vf++ {
-		devName, err = getVFDeviceName(master, vf)
+			if len(data) == 0 {
+				return nil, -1, "", fmt.Errorf("no data in the file %q", sriovFile)
+			}
 
-		// got a free vf
-		if err == nil {
-			vfIdx = vf
-			break
+			sriovNumfs := strings.TrimSpace(string(data))
+			vfTotal, err := strconv.Atoi(sriovNumfs)
+			if err != nil {
+				return nil, -1, "", fmt.Errorf("failed to convert sriov_numfs(byte value) to int of device %q: %v", master, err)
+			}
+
+			if vfTotal <= 0 {
+				return nil, -1, "", fmt.Errorf("no virtual function in the device %q: %v", master)
+			}
+
+			for vf := 0; vf < vfTotal; vf++ {
+				devName, err = getVFDeviceName(master, vf)
+
+				// got a free vf
+				if err == nil {
+					vfIdx = vf
+					break
+				}
+			}
+
+			if vfIdx == -1 {
+				return nil, -1, "", fmt.Errorf("can not get a free virtual function in directory %s", master)
+			}
+			return link, vfIdx, devName, nil
 		}
 	}
-
-	if vfIdx == -1 {
-		return -1, "", fmt.Errorf("can not get a free virtual function in directory %s", master)
-	}
-	return vfIdx, devName, nil
+	return nil, vfIdx, devName, fmt.Errorf("该主机无可用物理网卡")
 }
 
 func getVFDeviceName(master string, vf int) (string, error) {
